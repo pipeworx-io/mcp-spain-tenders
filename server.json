@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.pipeworx-io/spain-tenders",
+  "title": "Spain Tenders",
+  "description": "Spain public procurement MCP — PLACSP tender notices (keyless).",
+  "version": "0.1.0",
+  "websiteUrl": "https://pipeworx.io/packs/spain-tenders",
+  "repository": {
+    "url": "https://github.com/pipeworx-io/mcp-spain-tenders",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://gateway.pipeworx.io/spain-tenders/mcp"
+    }
+  ]
+}
