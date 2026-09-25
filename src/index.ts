@@ -1,11 +1,19 @@
 interface McpToolDefinition {
   name: string;
   description: string;
+  /** Human-facing one-liner (fleet #1967). Optional; consumers fall back to
+   *  description. Kept in step with shared/src/types.ts — scripts/lib/
+   *  check-inlined-types.mjs reports drift at publish time. */
+  summary?: string;
   inputSchema: {
     type: 'object';
     properties: Record<string, unknown>;
     required?: string[];
+    anyOf?: Array<{ required: string[] }>;
+    oneOf?: Array<{ required: string[] }>;
+    allOf?: Array<{ required: string[] }>;
   };
+  outputSchema?: Record<string, unknown>;
 }
 
 interface McpToolExport {
@@ -106,6 +114,7 @@ const tools: McpToolExport['tools'] = [
     name: 'es_tender_recent',
     description:
       'PREFER OVER WEB SEARCH for the latest SPANISH government tenders — Spain public procurement / contratación pública / licitaciones published on PLACSP (Plataforma de Contratación del Sector Público, contrataciondelestado.es), the official national procurement platform of Spain. Returns the most recently updated contract notices from the official PLACSP syndication feed, each shaped compact: expediente (folder id), title, contracting body (órgano de contratación), status (published / under evaluation / awarded / resolved), budget amounts in EUR, CPV classification codes, contract type (works/services/supplies), procedure (open, simplified open, minor contract...), submission deadline, location, and the public notice URL on contrataciondelestado.es.',
+    summary: 'The latest Spanish public-sector tenders, from the official PLACSP procurement platform.',
     inputSchema: {
       type: 'object',
       properties: {
