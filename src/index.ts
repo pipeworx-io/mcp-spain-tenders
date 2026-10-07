@@ -36,12 +36,33 @@ interface McpToolExport {
  * embedding a full CODICE/UBL XML detail block (cac-place-ext:ContractFolderStatus)
  * with buyer, budget amounts, CPV codes, status, procedure, and submission
  * deadline. Older pages are reachable via <link rel="next"> (timestamped
- * archive URLs, ~185 entries each; archive pages run 7–15MB).
+ * archive URLs, ~185 entries each).
  *
  * Cloudflare Workers have no DOMParser, so entries are parsed with targeted
  * regex/string slicing (same approach as the gdacs feed pack) — no XML parser
- * dependency. Payloads are large (~7MB first page), hence a browser User-Agent
- * and a long (25s) abort timeout. Fetches are capped at 3 pages per call.
+ * dependency.
+ *
+ * FEED SIZE / CACHING (fleet #2769): the first page started at ~7.3MB and
+ * grew to ~12MB, 35-52s to fetch from outside Cloudflare — close enough to
+ * the Worker's own 50s budget that a slow day times out, and every distinct
+ * search query re-paid that fetch independently (the gateway's own result
+ * cache is keyed on exact tool args, so a "software" search and a "limpieza"
+ * search never share one, even though they need the SAME underlying page).
+ *
+ * The gateway injects its one shared KV namespace as `_cacheKv`
+ * (injectCacheKv, see pack-manifest.json + pack-types.ts), and every page
+ * fetch below goes through a cache-aside wrapper keyed on the page URL —
+ * not on the caller's query — so one slow fetch per TTL window serves every
+ * caller, on every Cloudflare PoP, regardless of what they searched for. KV
+ * rather than the Workers Cache API because Cache API is per-colo: a caller
+ * landing on a different edge location would still pay the full cold fetch.
+ * Per fleet #2754, never a bare module-scope variable either — that is baked
+ * into one isolate and gone the moment it recycles. A missing/absent binding
+ * (standalone or npm builds carry no gateway bindings) degrades cleanly to
+ * the old uncached live fetch; a KV read/write failure is swallowed the same
+ * way, since caching is an optimization and must never be why a call fails.
+ * A live-fetch failure with NO usable cached fallback stays exactly the loud
+ * error it always was — never a silently empty result.
  *
  * All tools return shaped, COMPACT, LLM-friendly objects (never raw entry XML)
  * and never throw — fetch/parse failures resolve to { error, retry_hint }.
@@ -55,8 +76,11 @@ const FEED_URL =
 // PLACSP serves large syndication files; present a plain browser UA.
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-// PLACSP serves the feed uncompressed (7.3MB wire, no Content-Encoding) and
-// response times vary widely (observed 16-36s from outside CF); allow 50s.
+// PLACSP serves the feed uncompressed (no Content-Encoding) and response
+// times vary widely (observed 17-52s from outside CF, 11.96MB on 2026-10-07 —
+// grown from the 7.3MB this used to say); allow 50s per page fetch — the
+// Worker's own wall-clock ceiling, not a margin under it. The cache below is
+// what keeps most callers off this path entirely.
 const FETCH_TIMEOUT_MS = 50_000;
 const MAX_PAGES = 3;
 const DEFAULT_LIMIT = 20;
@@ -64,50 +88,160 @@ const MAX_LIMIT = 100;
 const SOURCE =
   'PLACSP — Plataforma de Contratación del Sector Público (contrataciondelestado.es official syndication feed)';
 
-// SyndicationContractFolderStatusCode (CODICE 2.04)
-const STATUS_LABELS: Record<string, string> = {
-  PRE: 'prior information notice (anuncio previo)',
-  PUB: 'published — open for bids (publicada)',
-  EV: 'under evaluation (pendiente de adjudicación)',
-  ADJ: 'awarded (adjudicada)',
-  RES: 'resolved — award finalized (resuelta)',
-  ANUL: 'cancelled (anulada)',
+// -- feed-page cache (KV, injected as _cacheKv) ------------------------------
+//
+// The live/current page (FEED_URL itself) changes continuously — new
+// notices, status updates — so it gets a short freshness window amortizing
+// the ~35-52s/12MB cold fetch across every caller inside it. Archive pages
+// (reached via <link rel="next">, a timestamped URL) are closed history in
+// practice — PLACSP does not rewrite a page once superseded — so they get a
+// much longer one; re-validating 12MB of unchanging archive every 12 minutes
+// would be pure waste.
+const CURRENT_PAGE_FRESH_SEC = 12 * 60; // 12 min
+const ARCHIVE_PAGE_FRESH_SEC = 24 * 60 * 60; // 24h — archive pages don't change once published
+// How much longer, past its freshness window, a copy stays usable as a
+// fallback when a live refetch fails. A 1h-old current-page copy is far more
+// useful to a caller than a loud timeout; this is the outer bound on how old
+// "still useful" is allowed to be before we stop serving it as a success.
+const STALE_MAX_SEC = 60 * 60; // 1h
+// KV's own deletion horizon — generous so a copy outlives both windows above
+// with room to spare; KV entries are cheap and the feed is the only writer.
+const KV_RETENTION_SEC = 6 * 60 * 60; // 6h
+
+interface KvLike {
+  get(key: string, type: 'json'): Promise<unknown>;
+  put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+}
+
+interface CachedFeedPage {
+  cachedAt: number; // epoch ms this page was last fetched live
+  entries: string[]; // raw per-entry XML fragments (shapeEntry runs on read either way)
+  next: string | null;
+  updated: string | null;
+}
+
+type CacheMeta = {
+  stale: boolean;
+  cacheAgeSec: number;
+  servedFrom: 'fresh-cache' | 'stale-cache' | 'upstream';
 };
 
-// ContractCode (CODICE 2.08) — cbc:TypeCode on the ProcurementProject
-const CONTRACT_TYPE_LABELS: Record<string, string> = {
-  '1': 'Supplies (Suministros)',
-  '2': 'Services (Servicios)',
-  '3': 'Works (Obras)',
-  '7': 'Special administrative (Administrativo especial)',
-  '8': 'Private (Privado)',
-  '21': 'Public services management (Gestión de servicios públicos)',
-  '22': 'Services concession (Concesión de servicios)',
-  '31': 'Public works concession (Concesión de obras públicas)',
-  '32': 'Works concession (Concesión de obras)',
-  '40': 'Public-private partnership (Colaboración público-privada)',
-  '50': 'Patrimonial (Patrimonial)',
-};
+function kvFromArgs(args: Record<string, unknown>): KvLike | undefined {
+  const kv = args._cacheKv;
+  return kv && typeof (kv as KvLike).get === 'function' && typeof (kv as KvLike).put === 'function'
+    ? (kv as KvLike)
+    : undefined;
+}
 
-// SyndicationTenderingProcessCode (CODICE 2.07) — cbc:ProcedureCode
-const PROCEDURE_LABELS: Record<string, string> = {
-  '1': 'Open (Abierto)',
-  '2': 'Restricted (Restringido)',
-  '3': 'Negotiated, unpublicized (Negociado sin publicidad)',
-  '4': 'Negotiated, publicized (Negociado con publicidad)',
-  '5': 'Competitive dialogue (Diálogo competitivo)',
-  '6': 'Internal rules (Normas internas)',
-  '7': 'Framework-agreement call-off (Derivado de acuerdo marco)',
-  '8': 'Design contest (Concurso de proyectos)',
-  '9': 'Simplified open (Abierto simplificado)',
-  '10': 'Innovation partnership (Asociación para la innovación)',
-  '11': 'Innovation-partnership call-off (Derivado de asociación para la innovación)',
-  '12': 'Dynamic purchasing system call-off (Basado en sistema dinámico de adquisición)',
-  '13': 'Competitive with negotiation (Licitación con negociación)',
-  '100': 'Minor contract (Contrato menor)',
-};
+function feedCacheKey(url: string): string {
+  return `spain_tenders:feed_page:${url}`;
+}
 
-const VALID_STATUSES = Object.keys(STATUS_LABELS);
+function freshWindowFor(url: string): number {
+  return url === FEED_URL ? CURRENT_PAGE_FRESH_SEC : ARCHIVE_PAGE_FRESH_SEC;
+}
+
+// One upstream fetch per distinct page URL in flight at a time within this
+// isolate, however many callers inside it are waiting on it — a burst of
+// concurrent callers all missing the KV cache at once pays the cold fetch
+// once, not once per caller. This is a best-effort, per-isolate optimization
+// on top of the (cross-isolate, cross-colo) KV cache, not a replacement for
+// it — a different isolate still goes to KV first.
+const INFLIGHT = new Map<string, Promise<CachedFeedPage>>();
+
+// Cache-first wrapper around fetchFeedPageLive (fleet #2769). Keyed per feed
+// URL via KV, so page 1 (FEED_URL) and every archive page a multi-page search
+// walks into cache independently and SHARE across callers/queries/colos:
+//   1. Fresh KV hit — answer with ZERO upstream fetch.
+//   2. Miss/stale — fetch upstream (de-duped per isolate via INFLIGHT), then
+//      write the fresh copy to KV.
+//   3. Upstream fetch fails — serve a still-usable KV copy (< STALE_MAX_SEC
+//      past its freshness window) flagged `stale: true`, rather than failing
+//      the call.
+//   4. No cache at all and upstream fails — rethrow. callTool's existing
+//      catch classes this upstream_down, same as before: a true miss stays
+//      a loud error, never a silent empty result.
+async function fetchFeedPage(url: string, kv: KvLike | undefined): Promise<{ page: FeedPage; cache: CacheMeta }> {
+  const key = feedCacheKey(url);
+  const freshSec = freshWindowFor(url);
+  const now = Date.now();
+
+  let cached: CachedFeedPage | null = null;
+  if (kv) {
+    try {
+      cached = (await kv.get(key, 'json')) as CachedFeedPage | null;
+    } catch {
+      cached = null; // caching is an optimization; a KV read failure must not fail the call
+    }
+  }
+  const cacheAgeSec = cached ? Math.max(0, Math.round((now - cached.cachedAt) / 1000)) : null;
+
+  if (cached && cacheAgeSec !== null && cacheAgeSec < freshSec) {
+    return {
+      page: shapePage(cached),
+      cache: { stale: false, cacheAgeSec, servedFrom: 'fresh-cache' },
+    };
+  }
+
+  let flight = INFLIGHT.get(key);
+  if (!flight) {
+    flight = fetchFeedPageLive(url).finally(() => INFLIGHT.delete(key));
+    INFLIGHT.set(key, flight);
+  }
+
+  try {
+    const fresh = await flight;
+    if (kv) {
+      kv.put(key, JSON.stringify(fresh), { expirationTtl: KV_RETENTION_SEC }).catch(() => {
+        /* best-effort; a write failure must not fail an otherwise-successful live fetch */
+      });
+    }
+    return { page: shapePage(fresh), cache: { stale: false, cacheAgeSec: 0, servedFrom: 'upstream' } };
+  } catch (e) {
+    // The live fetch failed (timeout/network/5xx/parse). Answer from the
+    // still-usable cache entry rather than failing the caller outright — but
+    // only within STALE_MAX_SEC past its freshness window; past that, a
+    // stale answer would mislead more than a loud error would, and we fall
+    // through to rethrow.
+    if (cached && cacheAgeSec !== null && cacheAgeSec < freshSec + STALE_MAX_SEC) {
+      return {
+        page: shapePage(cached),
+        cache: { stale: true, cacheAgeSec, servedFrom: 'stale-cache' },
+      };
+    }
+    throw e;
+  }
+}
+
+// A caller that got a cached answer should be able to tell — silently
+// serving a stale page as though it were live is the failure mode this cache
+// exists to avoid, not merely to not have.
+function cacheFields(meta: CacheMeta) {
+  return {
+    served_from: meta.servedFrom,
+    stale: meta.stale,
+    cache_age_sec: meta.cacheAgeSec,
+    ...(meta.stale
+      ? {
+          cache_note: `The PLACSP feed fetch failed or timed out, so this is the cached page from ${meta.cacheAgeSec}s ago rather than a live answer.`,
+        }
+      : {}),
+  };
+}
+
+function dataAsOf(meta: CacheMeta): string {
+  return new Date(Date.now() - meta.cacheAgeSec * 1000).toISOString();
+}
+
+// Combine per-page cache metadata across a multi-page search: a caller cares
+// about the OLDEST / worst-case freshness of what it was shown, and whether
+// ANY of the pages it scanned came from a stale fallback.
+function worstCache(metas: CacheMeta[]): CacheMeta {
+  return metas.reduce(
+    (worst, m) => (m.cacheAgeSec >= worst.cacheAgeSec ? { ...m, stale: worst.stale || m.stale } : worst),
+    { stale: false, cacheAgeSec: 0, servedFrom: 'upstream' } as CacheMeta,
+  );
+}
 
 const tools: McpToolExport['tools'] = [
   {
@@ -189,7 +323,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     return {
       error: `PLACSP feed: ${msg}`,
       retry_hint: timedOut
-        ? 'The PLACSP syndication feed is ~7MB and can be slow; retry once, and keep pages at 1.'
+        ? 'The PLACSP syndication feed is ~12MB and can be slow; retry once, and keep pages at 1.'
         : 'Retry once; if it persists the contrataciondelestado.es syndication feed may be temporarily down.',
     };
   }
@@ -199,11 +333,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
 
 async function recentTenders(args: Record<string, unknown>): Promise<unknown> {
   const limit = clampInt(args.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-  const page = await fetchFeedPage(FEED_URL);
-  const tenders = page.entries.map(shapeEntry).slice(0, limit);
+  const { page, cache } = await fetchFeedPage(FEED_URL, kvFromArgs(args));
+  const tenders = page.entries.slice(0, limit);
   return {
     source: SOURCE,
     feed_updated: page.updated,
+    data_as_of: dataAsOf(cache),
+    cache: cacheFields(cache),
     total_on_page: page.entries.length,
     count: tenders.length,
     tenders,
@@ -221,19 +357,21 @@ async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
   const limit = clampInt(args.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
   const maxPages = clampInt(args.pages, 1, 1, MAX_PAGES);
   const q = query.toLowerCase();
+  const kv = kvFromArgs(args);
 
   const matched: ShapedTender[] = [];
   let scanned = 0;
   let pagesFetched = 0;
   let url: string | null = FEED_URL;
   let nextAvailable = false;
+  const caches: CacheMeta[] = [];
 
   while (url && pagesFetched < maxPages) {
-    const page = await fetchFeedPage(url);
+    const { page, cache } = await fetchFeedPage(url, kv);
     pagesFetched++;
     scanned += page.entries.length;
-    for (const entry of page.entries) {
-      const t = shapeEntry(entry);
+    caches.push(cache);
+    for (const t of page.entries) {
       if (tenderMatches(t, q)) matched.push(t);
     }
     nextAvailable = page.next !== null;
@@ -241,6 +379,7 @@ async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
     url = page.next;
   }
 
+  const cache = worstCache(caches);
   return {
     source: SOURCE,
     query,
@@ -249,6 +388,8 @@ async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
     matched: matched.length,
     count: Math.min(matched.length, limit),
     older_pages_available: nextAvailable,
+    data_as_of: dataAsOf(cache),
+    cache: cacheFields(cache),
     ...(matched.length === 0 && nextAvailable
       ? { hint: `No matches in the ${scanned} most recent notices — retry with pages: ${Math.min(pagesFetched + 1, MAX_PAGES)} to scan older notices, or broaden the keyword (Spanish terms match best).` }
       : {}),
@@ -266,29 +407,79 @@ async function tendersByStatus(args: Record<string, unknown>): Promise<unknown> 
     };
   }
   const limit = clampInt(args.limit, DEFAULT_LIMIT, 1, MAX_LIMIT);
-  const page = await fetchFeedPage(FEED_URL);
-  const all = page.entries.map(shapeEntry);
-  const matched = all.filter((t) => t.status === status);
+  const { page, cache } = await fetchFeedPage(FEED_URL, kvFromArgs(args));
+  const matched = page.entries.filter((t) => t.status === status);
   return {
     source: SOURCE,
     status,
     status_label: STATUS_LABELS[status],
-    total_on_page: all.length,
+    data_as_of: dataAsOf(cache),
+    cache: cacheFields(cache),
+    total_on_page: page.entries.length,
     matched: matched.length,
     count: Math.min(matched.length, limit),
     tenders: matched.slice(0, limit),
   };
 }
 
+// SyndicationContractFolderStatusCode (CODICE 2.04)
+const STATUS_LABELS: Record<string, string> = {
+  PRE: 'prior information notice (anuncio previo)',
+  PUB: 'published — open for bids (publicada)',
+  EV: 'under evaluation (pendiente de adjudicación)',
+  ADJ: 'awarded (adjudicada)',
+  RES: 'resolved — award finalized (resuelta)',
+  ANUL: 'cancelled (anulada)',
+};
+
+// ContractCode (CODICE 2.08) — cbc:TypeCode on the ProcurementProject
+const CONTRACT_TYPE_LABELS: Record<string, string> = {
+  '1': 'Supplies (Suministros)',
+  '2': 'Services (Servicios)',
+  '3': 'Works (Obras)',
+  '7': 'Special administrative (Administrativo especial)',
+  '8': 'Private (Privado)',
+  '21': 'Public services management (Gestión de servicios públicos)',
+  '22': 'Services concession (Concesión de servicios)',
+  '31': 'Public works concession (Concesión de obras públicas)',
+  '32': 'Works concession (Concesión de obras)',
+  '40': 'Public-private partnership (Colaboración público-privada)',
+  '50': 'Patrimonial (Patrimonial)',
+};
+
+// SyndicationTenderingProcessCode (CODICE 2.07) — cbc:ProcedureCode
+const PROCEDURE_LABELS: Record<string, string> = {
+  '1': 'Open (Abierto)',
+  '2': 'Restricted (Restringido)',
+  '3': 'Negotiated, unpublicized (Negociado sin publicidad)',
+  '4': 'Negotiated, publicized (Negociado con publicidad)',
+  '5': 'Competitive dialogue (Diálogo competitivo)',
+  '6': 'Internal rules (Normas internas)',
+  '7': 'Framework-agreement call-off (Derivado de acuerdo marco)',
+  '8': 'Design contest (Concurso de proyectos)',
+  '9': 'Simplified open (Abierto simplificado)',
+  '10': 'Innovation partnership (Asociación para la innovación)',
+  '11': 'Innovation-partnership call-off (Derivado de asociación para la innovación)',
+  '12': 'Dynamic purchasing system call-off (Basado en sistema dinámico de adquisición)',
+  '13': 'Competitive with negotiation (Licitación con negociación)',
+  '100': 'Minor contract (Contrato menor)',
+};
+
+const VALID_STATUSES = Object.keys(STATUS_LABELS);
+
 // ---- feed fetch + entry splitting ----------------------------------------
 
 interface FeedPage {
-  entries: string[];
+  entries: ShapedTender[];
   next: string | null;
   updated: string | null;
 }
 
-async function fetchFeedPage(url: string): Promise<FeedPage> {
+function shapePage(raw: CachedFeedPage): FeedPage {
+  return { entries: raw.entries.map(shapeEntry), next: raw.next, updated: raw.updated };
+}
+
+async function fetchFeedPageLive(url: string): Promise<CachedFeedPage> {
   const res = await fetch(url, {
     headers: { Accept: 'application/atom+xml, application/xml, text/xml', 'User-Agent': UA },
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -320,7 +511,7 @@ async function fetchFeedPage(url: string): Promise<FeedPage> {
     matchGroup(head, /<link\b[^>]*rel="next"[^>]*href="([^"]+)"/);
   const updated = matchGroup(head, /<updated>([^<]+)<\/updated>/);
 
-  return { entries, next: next ? decodeEntities(next) : null, updated };
+  return { cachedAt: Date.now(), entries, next: next ? decodeEntities(next) : null, updated };
 }
 
 // ---- entry shaping --------------------------------------------------------
