@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-spain-tenders",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Spain public procurement MCP — PLACSP tender notices (keyless).",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-5d71537f663b9005ae5af2e0fc9ce9c1afc86ade84ac4b4ee3b44471d968c6a4",
-    "sourceCommit": "be47827ad0f444e813e7224db0489c4ea890a30e"
+    "sourceHash": "v1-f1b2732194cd4602c7704c4c61ab5444d5abbcd84a3656b67c0e30ee46479435",
+    "sourceCommit": "4f465027cf3de54acf4976d8118ae3423a8ec9fa"
   }
 }

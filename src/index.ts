@@ -390,6 +390,11 @@ async function searchTenders(args: Record<string, unknown>): Promise<unknown> {
     older_pages_available: nextAvailable,
     data_as_of: dataAsOf(cache),
     cache: cacheFields(cache),
+    // 2026-10-14: when the feed page comes from this pack's own KV cache no
+    // upstream call is made, and the gateway's empty-reason inference then
+    // books a zero-match answer as `not_queried` (13 of 17 rows for one caller
+    // in 2d) — the data WAS queried, against a fresh copy. Declare the reason.
+    ...(matched.length === 0 ? { empty_reason: 'no_match' } : {}),
     ...(matched.length === 0 && nextAvailable
       ? { hint: `No matches in the ${scanned} most recent notices — retry with pages: ${Math.min(pagesFetched + 1, MAX_PAGES)} to scan older notices, or broaden the keyword (Spanish terms match best).` }
       : {}),
